@@ -98,6 +98,20 @@ func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusCreated, view)
 }
 
+func (s *Server) revokeSeal(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RevokeSealRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.RevokeSeal(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
 func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	view, err := s.service.Case(request.Context(), request.PathValue("id"))
 	if err != nil {

@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"revoke-seal":              checkRevokeSeal,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -373,6 +374,259 @@ func checkSealVerification() error {
 		return errors.New("evidence seal is missing")
 	}
 	return nil
+}
+
+func checkRevokeSeal() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-1",
+		"summary":  "initial evidence seal",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	firstSealID, err := nestedString(sealed.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	firstMeasurementID, err := nestedString(sealed.Body, "seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+	if status, err := nestedString(sealed.Body, "seal", "status"); err != nil || status != "active" {
+		return fmt.Errorf("fresh seal status = %q, err = %v", status, err)
+	}
+
+	missingReason, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"actor": "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingReason, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missingReason, "invalid_input"); err != nil {
+		return err
+	}
+
+	revoked, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"actor":  "Lin",
+		"reason": "reference standard was found out of calibration",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(revoked, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(revoked.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("revoked case state = %q", state)
+	}
+	caseView, ok := revoked.Body["case"].(map[string]any)
+	if !ok {
+		return errors.New("case view is missing after revoke")
+	}
+	if _, exists := caseView["sealed_at"]; exists {
+		return errors.New("revoked case still carries sealed_at")
+	}
+	if _, exists := revoked.Body["seal"]; exists {
+		return errors.New("revoked case still exposes an active seal")
+	}
+	if err := expectSealStatus(revoked.Body, 0, firstSealID, "revoked"); err != nil {
+		return err
+	}
+	if _, err := nestedAny(revoked.Body, "seal_history", 0, "revoked_at"); err != nil {
+		return fmt.Errorf("revoked seal is missing revoked_at: %w", err)
+	}
+	revocations, err := nestedSlice(revoked.Body, "revocations")
+	if err != nil {
+		return err
+	}
+	if len(revocations) != 1 {
+		return fmt.Errorf("revocation facts = %d, expected 1", len(revocations))
+	}
+	revocation, ok := revocations[0].(map[string]any)
+	if !ok {
+		return errors.New("revocation fact is not an object")
+	}
+	if revocation["seal_id"] != firstSealID || revocation["actor"] != "Lin" || revocation["reason"] == "" {
+		return fmt.Errorf("revocation fact lost its seal, actor, or reason: %v", revocation)
+	}
+
+	duplicate, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"actor":  "Lin",
+		"reason": "duplicate revocation attempt",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "state_conflict"); err != nil {
+		return err
+	}
+
+	// The replacement measurement deviates more than the revoked one, so a
+	// re-seal that still considered pre-revocation evidence would pick the
+	// revoked measurement and fail the later measurement check.
+	remeasured, err := h.recordMeasurement(caseID, 25.4, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(remeasured, http.StatusCreated); err != nil {
+		return err
+	}
+	newMeasurementID, err := nestedAnyString(remeasured.Body, "measurements", 1, "id")
+	if err != nil {
+		return err
+	}
+	if newMeasurementID == firstMeasurementID {
+		return errors.New("re-measurement did not append a new measurement")
+	}
+
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+				"reviewer": fmt.Sprintf("Reviewer-%d", index+2),
+				"summary":  "replacement evidence seal after revocation",
+			})
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent re-seal status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent re-seal outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	finalState, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if finalState != "sealed" {
+		return fmt.Errorf("re-sealed case state = %q", finalState)
+	}
+	secondSealID, err := nestedString(read.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	if secondSealID == firstSealID {
+		return errors.New("re-seal reused the revoked seal id")
+	}
+	supersedes, err := nestedString(read.Body, "seal", "supersedes_seal_id")
+	if err != nil {
+		return err
+	}
+	if supersedes != firstSealID {
+		return fmt.Errorf("re-seal supersedes %q, expected revoked seal %q", supersedes, firstSealID)
+	}
+	sealedMeasurement, err := nestedString(read.Body, "seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+	if sealedMeasurement != newMeasurementID {
+		return fmt.Errorf("re-seal selected measurement %q, expected post-revocation %q", sealedMeasurement, newMeasurementID)
+	}
+	if err := expectSealStatus(read.Body, 0, firstSealID, "revoked"); err != nil {
+		return err
+	}
+	if err := expectSealStatus(read.Body, 1, secondSealID, "active"); err != nil {
+		return err
+	}
+	history, err := nestedSlice(read.Body, "seal_history")
+	if err != nil {
+		return err
+	}
+	if len(history) != 2 {
+		return fmt.Errorf("seal history = %d entries, expected 2", len(history))
+	}
+	finalRevocations, err := nestedSlice(read.Body, "revocations")
+	if err != nil {
+		return err
+	}
+	if len(finalRevocations) != 1 {
+		return fmt.Errorf("revocation facts after re-seal = %d, expected 1", len(finalRevocations))
+	}
+	if !hasEvent(read.Body, "seal_revoked") {
+		return errors.New("seal_revoked audit event is missing")
+	}
+	return nil
+}
+
+func expectSealStatus(root map[string]any, index int, id, status string) error {
+	sealID, err := nestedAnyString(root, "seal_history", index, "id")
+	if err != nil {
+		return err
+	}
+	if sealID != id {
+		return fmt.Errorf("seal_history[%d] = %q, expected %q", index, sealID, id)
+	}
+	actual, err := nestedAnyString(root, "seal_history", index, "status")
+	if err != nil {
+		return err
+	}
+	if actual != status {
+		return fmt.Errorf("seal %s status = %q, expected %q", id, actual, status)
+	}
+	return nil
+}
+
+func nestedAnyString(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
 }
 
 func newHarness() *harness {

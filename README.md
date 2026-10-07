@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow revoke-seal
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -41,7 +42,16 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/revoke-seal`
 - `GET /cases/{id}/events`
+
+A sealed case can be withdrawn with `POST /cases/{id}/revoke-seal` when the
+measurement basis or equipment status behind the seal is found defective. The
+revocation is stored as its own fact with the actor and reason, the original
+seal stays readable as `revoked` in `seal_history`, and the case returns to
+`awaiting_measurement`. A later seal supersedes the revoked one via
+`supersedes_seal_id` and selects only measurements recorded after the
+revocation, so a case never exposes two contradictory active seals.
 
 ## Layout
 

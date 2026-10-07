@@ -155,6 +155,28 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "revoke-seal",
+      "name": "Revoke evidence seal",
+      "entry": "POST /cases/{id}/revoke-seal",
+      "steps": [
+        "verify the case is sealed and holds an active seal",
+        "record an independent revocation fact with actor and reason",
+        "mark the seal revoked without deleting it and return the case to awaiting_measurement"
+      ],
+      "success": "returns the case in a measurable state with the revoked seal preserved in history",
+      "failure": "returns conflict for a non-sealed case or a duplicate revocation",
+      "verification": "workflowcheck revokes a seal, rejects a duplicate revocation, races two re-seals, and verifies the replacement seal supersedes the revoked one",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {
@@ -164,6 +186,6 @@
       "error_propagation",
       "concurrency"
     ],
-    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic."
+    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic. Seal revocation is an independent fact that preserves the revoked seal, and a re-seal supersedes it so a case never holds two active seals."
   }
 }

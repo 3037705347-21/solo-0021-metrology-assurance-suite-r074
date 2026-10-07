@@ -31,6 +31,11 @@ type SealCaseRequest struct {
 	Summary  string `json:"summary"`
 }
 
+type RevokeSealRequest struct {
+	Actor  string `json:"actor"`
+	Reason string `json:"reason"`
+}
+
 type DeviceResponse struct {
 	Device domain.Device `json:"device"`
 }
@@ -39,6 +44,8 @@ type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
+	SealHistory  []domain.EvidenceSeal   `json:"seal_history,omitempty"`
+	Revocations  []domain.SealRevocation `json:"revocations,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
 }
 

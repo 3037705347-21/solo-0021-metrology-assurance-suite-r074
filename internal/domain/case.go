@@ -105,6 +105,17 @@ func (c *VerificationCase) Seal(at time.Time) error {
 	return nil
 }
 
+func (c *VerificationCase) RevokeSeal(at time.Time) error {
+	if c.State != CaseSealed {
+		return fmt.Errorf("%w: only a sealed case can have its seal revoked", ErrStateConflict)
+	}
+	c.State = CaseAwaitingMeasurement
+	c.Version++
+	c.UpdatedAt = at.UTC()
+	c.SealedAt = nil
+	return nil
+}
+
 func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
