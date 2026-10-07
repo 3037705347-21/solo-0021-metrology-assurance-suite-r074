@@ -13,7 +13,8 @@ type Repository struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
+	seals        map[string][]domain.EvidenceSeal
+	revocations  map[string][]domain.SealRevocation
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -23,7 +24,8 @@ func New() *Repository {
 		devices:      make(map[string]domain.Device),
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
-		seals:        make(map[string]domain.EvidenceSeal),
+		seals:        make(map[string][]domain.EvidenceSeal),
+		revocations:  make(map[string][]domain.SealRevocation),
 		counters:     make(map[string]int),
 	}
 }
@@ -32,7 +34,8 @@ type Snapshot struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
+	seals        map[string][]domain.EvidenceSeal
+	revocations  map[string][]domain.SealRevocation
 	events       []domain.AuditEvent
 }
 
@@ -60,8 +63,27 @@ func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 }
 
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
-	item, ok := s.seals[caseID]
-	return item, ok
+	items := s.seals[caseID]
+	if len(items) == 0 {
+		return domain.EvidenceSeal{}, false
+	}
+	return items[len(items)-1], true
+}
+
+func (s Snapshot) Seals(caseID string) []domain.EvidenceSeal {
+	return append([]domain.EvidenceSeal(nil), s.seals[caseID]...)
+}
+
+func (s Snapshot) ActiveSeal(caseID string) (domain.EvidenceSeal, bool) {
+	seal, exists := s.Seal(caseID)
+	if !exists || !seal.IsActive() {
+		return domain.EvidenceSeal{}, false
+	}
+	return seal, true
+}
+
+func (s Snapshot) Revocations(caseID string) []domain.SealRevocation {
+	return append([]domain.SealRevocation(nil), s.revocations[caseID]...)
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
@@ -94,7 +116,8 @@ type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
+	seals        map[string][]domain.EvidenceSeal
+	revocations  map[string][]domain.SealRevocation
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -177,15 +200,57 @@ func (m *Mutation) Measurements(caseID string) []domain.Measurement {
 }
 
 func (m *Mutation) Seal(caseID string) (domain.EvidenceSeal, bool) {
-	item, ok := m.seals[caseID]
-	return item, ok
+	items := m.seals[caseID]
+	if len(items) == 0 {
+		return domain.EvidenceSeal{}, false
+	}
+	return items[len(items)-1], true
+}
+
+func (m *Mutation) Seals(caseID string) []domain.EvidenceSeal {
+	return append([]domain.EvidenceSeal(nil), m.seals[caseID]...)
+}
+
+func (m *Mutation) ActiveSeal(caseID string) (domain.EvidenceSeal, bool) {
+	seal, exists := m.Seal(caseID)
+	if !exists || !seal.IsActive() {
+		return domain.EvidenceSeal{}, false
+	}
+	return seal, true
 }
 
 func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
-	if _, exists := m.seals[item.CaseID]; exists {
-		return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.CaseID)
+	for _, existing := range m.seals[item.CaseID] {
+		if existing.IsActive() {
+			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.CaseID)
+		}
 	}
-	m.seals[item.CaseID] = item
+	m.seals[item.CaseID] = append(m.seals[item.CaseID], item)
+	return nil
+}
+
+func (m *Mutation) UpdateSeal(item domain.EvidenceSeal) error {
+	items := m.seals[item.CaseID]
+	for index, existing := range items {
+		if existing.ID == item.ID {
+			items[index] = item
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: seal %s", domain.ErrNotFound, item.ID)
+}
+
+func (m *Mutation) Revocations(caseID string) []domain.SealRevocation {
+	return append([]domain.SealRevocation(nil), m.revocations[caseID]...)
+}
+
+func (m *Mutation) PutRevocation(item domain.SealRevocation) error {
+	for _, existing := range m.revocations[item.CaseID] {
+		if existing.SealID == item.SealID {
+			return fmt.Errorf("%w: seal %s", domain.ErrSealAlreadyRevoked, item.SealID)
+		}
+	}
+	m.revocations[item.CaseID] = append(m.revocations[item.CaseID], item)
 	return nil
 }
 
@@ -224,6 +289,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		revocations:  cloneRevocations(r.revocations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +300,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.revocations = next.revocations
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +312,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		revocations:  cloneRevocations(r.revocations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -273,10 +341,18 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 	return result
 }
 
-func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
-	result := make(map[string]domain.EvidenceSeal, len(values))
+func cloneSeals(values map[string][]domain.EvidenceSeal) map[string][]domain.EvidenceSeal {
+	result := make(map[string][]domain.EvidenceSeal, len(values))
 	for key, value := range values {
-		result[key] = value
+		result[key] = append([]domain.EvidenceSeal(nil), value...)
+	}
+	return result
+}
+
+func cloneRevocations(values map[string][]domain.SealRevocation) map[string][]domain.SealRevocation {
+	result := make(map[string][]domain.SealRevocation, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.SealRevocation(nil), value...)
 	}
 	return result
 }

@@ -3,7 +3,9 @@
 Metrology Assurance Suite is a Go HTTP service for bounded laboratory
 measurement assurance work. It registers devices, opens verification cases,
 records measurements, handles failed tolerance decisions, and seals traceable
-evidence records.
+evidence records. A flawed seal can be formally revoked with a recorded
+reason; the case then returns to measurement and any successor seal links back
+to the revoked one.
 
 ## Run
 
@@ -22,6 +24,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow revoke-seal
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -41,6 +44,7 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/revoke-seal`
 - `GET /cases/{id}/events`
 
 ## Layout

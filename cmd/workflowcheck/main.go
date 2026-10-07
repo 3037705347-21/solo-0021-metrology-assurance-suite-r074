@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +39,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"revoke-seal":              checkRevokeSeal,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +375,334 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkRevokeSeal() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Wei",
+		"summary":  "initial evidence seal",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	oldSealID, err := nestedString(sealed.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	oldStatus, err := nestedString(sealed.Body, "seal", "status")
+	if err != nil {
+		return err
+	}
+	if oldStatus != "active" {
+		return fmt.Errorf("fresh seal status = %q", oldStatus)
+	}
+
+	missingReason, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"reviewer": "Wei",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingReason, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missingReason, "invalid_input"); err != nil {
+		return err
+	}
+
+	revoked, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "reference standard certificate expired",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(revoked, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(revoked.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("revoked case state = %q", state)
+	}
+	caseBody, ok := revoked.Body["case"].(map[string]any)
+	if !ok {
+		return errors.New("case payload is missing after revocation")
+	}
+	if _, exists := caseBody["sealed_at"]; exists {
+		return errors.New("revoked case must not carry sealed_at")
+	}
+	preservedID, err := nestedString(revoked.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	if preservedID != oldSealID {
+		return fmt.Errorf("original seal id = %q, expected preserved %q", preservedID, oldSealID)
+	}
+	preservedStatus, err := nestedString(revoked.Body, "seal", "status")
+	if err != nil {
+		return err
+	}
+	if preservedStatus != "revoked" {
+		return fmt.Errorf("revoked seal status = %q", preservedStatus)
+	}
+	revocationSeal, err := nestedStringAt(revoked.Body, "revocations", 0, "seal_id")
+	if err != nil {
+		return err
+	}
+	if revocationSeal != oldSealID {
+		return fmt.Errorf("revocation targets seal %q, expected %q", revocationSeal, oldSealID)
+	}
+	revocationReason, err := nestedStringAt(revoked.Body, "revocations", 0, "reason")
+	if err != nil {
+		return err
+	}
+	if revocationReason != "reference standard certificate expired" {
+		return fmt.Errorf("revocation reason = %q", revocationReason)
+	}
+	revocationReviewer, err := nestedStringAt(revoked.Body, "revocations", 0, "reviewer")
+	if err != nil {
+		return err
+	}
+	if revocationReviewer != "Wei" {
+		return fmt.Errorf("revocation reviewer = %q", revocationReviewer)
+	}
+
+	duplicate, err := h.request(http.MethodPost, "/cases/"+caseID+"/revoke-seal", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "duplicate revocation attempt",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "state_conflict"); err != nil {
+		return err
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	readStatus, err := nestedString(read.Body, "seal", "status")
+	if err != nil {
+		return err
+	}
+	if readStatus != "revoked" {
+		return fmt.Errorf("read back seal status = %q", readStatus)
+	}
+	if !hasEvent(read.Body, "seal_revoked") {
+		return errors.New("seal_revoked audit event is missing")
+	}
+
+	remeasure, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(remeasure, http.StatusCreated); err != nil {
+		return err
+	}
+	remeasureState, err := nestedString(remeasure.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if remeasureState != "review_ready" {
+		return fmt.Errorf("re-measured case state = %q", remeasureState)
+	}
+
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+				"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
+				"summary":  "successor seal after revocation",
+			})
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent re-seal status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent re-seal outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	final, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(final, http.StatusOK); err != nil {
+		return err
+	}
+	finalState, err := nestedString(final.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if finalState != "sealed" {
+		return fmt.Errorf("re-sealed case state = %q", finalState)
+	}
+	newSealID, err := nestedString(final.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	if newSealID == oldSealID {
+		return errors.New("re-seal reused the revoked seal id")
+	}
+	supersedes, err := nestedString(final.Body, "seal", "supersedes_seal_id")
+	if err != nil {
+		return err
+	}
+	if supersedes != oldSealID {
+		return fmt.Errorf("successor seal supersedes %q, expected %q", supersedes, oldSealID)
+	}
+	history, err := nestedSlice(final.Body, "seals")
+	if err != nil {
+		return err
+	}
+	if len(history) != 2 {
+		return fmt.Errorf("seal history has %d entries, expected 2", len(history))
+	}
+	active := 0
+	for _, entry := range history {
+		sealMap, ok := entry.(map[string]any)
+		if !ok {
+			return errors.New("seal history entry is not an object")
+		}
+		if sealMap["status"] == "active" {
+			active++
+		}
+	}
+	if active != 1 {
+		return fmt.Errorf("case has %d active seals, expected exactly 1", active)
+	}
+	firstStatus, err := nestedStringAt(final.Body, "seals", 0, "status")
+	if err != nil {
+		return err
+	}
+	if firstStatus != "revoked" {
+		return fmt.Errorf("superseded seal status = %q", firstStatus)
+	}
+	revocations, err := nestedSlice(final.Body, "revocations")
+	if err != nil {
+		return err
+	}
+	if len(revocations) != 1 {
+		return fmt.Errorf("revocation history has %d entries, expected 1", len(revocations))
+	}
+
+	raceCaseID, err := h.readyCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	raceSealed, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/seal", map[string]any{
+		"reviewer": "Wei",
+		"summary":  "seal before concurrent revocation",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(raceSealed, http.StatusCreated); err != nil {
+		return err
+	}
+	type revokeOutcome struct {
+		response apiResponse
+		err      error
+	}
+	revokeResults := make(chan revokeOutcome, 2)
+	var revokeWait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		revokeWait.Add(1)
+		go func(index int) {
+			defer revokeWait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/revoke-seal", map[string]any{
+				"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
+				"reason":   "calibration basis invalidated",
+			})
+			revokeResults <- revokeOutcome{response: response, err: err}
+		}(index)
+	}
+	revokeWait.Wait()
+	close(revokeResults)
+
+	revokeSuccesses := 0
+	revokeConflicts := 0
+	for item := range revokeResults {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusOK:
+			revokeSuccesses++
+		case http.StatusConflict:
+			revokeConflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent revoke status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if revokeSuccesses != 1 || revokeConflicts != 1 {
+		return fmt.Errorf("concurrent revoke outcomes: %d success, %d conflict", revokeSuccesses, revokeConflicts)
+	}
+	raceRead, err := h.request(http.MethodGet, "/cases/"+raceCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(raceRead, http.StatusOK); err != nil {
+		return err
+	}
+	raceRevocations, err := nestedSlice(raceRead.Body, "revocations")
+	if err != nil {
+		return err
+	}
+	if len(raceRevocations) != 1 {
+		return fmt.Errorf("concurrent revoke left %d revocation records, expected 1", len(raceRevocations))
+	}
+	raceState, err := nestedString(raceRead.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if raceState != "awaiting_measurement" {
+		return fmt.Errorf("concurrently revoked case state = %q", raceState)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -528,13 +856,21 @@ func expectErrorCode(response apiResponse, expected string) error {
 }
 
 func nestedString(root map[string]any, path ...string) (string, error) {
-	value, err := nestedValue(root, path...)
+	parts := make([]any, 0, len(path))
+	for _, part := range path {
+		parts = append(parts, part)
+	}
+	return nestedStringAt(root, parts...)
+}
+
+func nestedStringAt(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
 	if err != nil {
 		return "", err
 	}
 	text, ok := value.(string)
 	if !ok {
-		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }
@@ -578,14 +914,6 @@ func hasEvent(root map[string]any, kind string) bool {
 		}
 	}
 	return false
-}
-
-func nestedValue(root map[string]any, path ...string) (any, error) {
-	parts := make([]any, 0, len(path))
-	for _, part := range path {
-		parts = append(parts, part)
-	}
-	return nestedAny(root, parts...)
 }
 
 func nestedAny(root map[string]any, path ...any) (any, error) {

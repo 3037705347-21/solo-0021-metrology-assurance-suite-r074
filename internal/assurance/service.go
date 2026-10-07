@@ -240,8 +240,12 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if _, exists := m.Seal(item.ID); exists {
-			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
+		var supersedes string
+		if prior, exists := m.Seal(item.ID); exists {
+			if prior.IsActive() {
+				return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
+			}
+			supersedes = prior.ID
 		}
 		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
 		if !ok {
@@ -257,6 +261,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
+			supersedes,
 			s.now(),
 		)
 		if err != nil {
@@ -288,6 +293,69 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
+func (s *Service) RevokeSeal(ctx context.Context, caseID string, input contracts.RevokeSealRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		seal, exists := m.ActiveSeal(item.ID)
+		if !exists {
+			return fmt.Errorf("%w: case %s has no active evidence seal", domain.ErrStateConflict, item.ID)
+		}
+		if err := item.RevokeSeal(s.now()); err != nil {
+			return err
+		}
+		reviewer := strings.TrimSpace(input.Reviewer)
+		reason := strings.TrimSpace(input.Reason)
+		if reviewer == "" || reason == "" {
+			return fmt.Errorf("%w: reviewer and reason are required", domain.ErrInvalidInput)
+		}
+		if err := seal.MarkRevoked(); err != nil {
+			return err
+		}
+		revocation, err := domain.NewSealRevocation(
+			m.NextID("revocation"),
+			seal.ID,
+			item.ID,
+			reviewer,
+			reason,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.PutRevocation(revocation); err != nil {
+			return err
+		}
+		if err := m.UpdateSeal(seal); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"seal",
+			seal.ID,
+			item.ID,
+			"seal_revoked",
+			revocation.Reviewer,
+			revocation.Reason,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		result = caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
 	var selected domain.Measurement
 	found := false
@@ -307,6 +375,8 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: m.Measurements(item.ID),
+		Seals:        m.Seals(item.ID),
+		Revocations:  m.Revocations(item.ID),
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
@@ -319,6 +389,8 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: snapshot.Measurements(item.ID),
+		Seals:        snapshot.Seals(item.ID),
+		Revocations:  snapshot.Revocations(item.ID),
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {

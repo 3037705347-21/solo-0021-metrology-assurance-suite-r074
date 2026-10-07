@@ -27,7 +27,10 @@ external service.
 - Measurement: an observed value, computed deviation, acceptance decision,
   technician, and timestamp.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
-  selected accepted measurement.
+  selected accepted measurement, a lifecycle status, and a traceable link to
+  the seal it supersedes.
+- SealRevocation: the independent fact recording that a reviewer withdrew a
+  seal, preserving the reason and the responsible reviewer.
 - AuditEvent: an append-only trace of meaningful case and device changes.
 
 ## Workflows
@@ -62,8 +65,21 @@ service records the actor and reason in the audit trail.
 
 The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 `review_ready` cases may be sealed. The service selects the accepted
-measurement with the smallest absolute deviation, creates exactly one evidence
-seal, moves the case to `sealed`, and rejects later mutations.
+measurement with the smallest absolute deviation, creates exactly one active
+evidence seal, moves the case to `sealed`, and rejects later mutations. When
+the case carries a revoked seal, the new seal must reference it through
+`supersedes_seal_id` so the succession of evidence stays traceable.
+
+### 6. Revoke Evidence Seal
+
+The verifier sends `POST /cases/{id}/revoke-seal` with a reviewer and a reason
+when the measurement basis or device state behind a sealed case turns out to
+be flawed. Only `sealed` cases with an active seal may be revoked. In one
+atomic commit the service creates an independent seal revocation record,
+marks the original seal `revoked` without erasing it, returns the case to
+`awaiting_measurement`, and appends a `seal_revoked` audit event naming the
+responsible reviewer. A revoked case must be measured again before it can be
+sealed again.
 
 ## State And Rules
 
@@ -78,7 +94,13 @@ VerificationCase state:
 - `awaiting_measurement -> recheck_required`
 - `recheck_required -> awaiting_measurement`
 - `review_ready -> sealed`
-- `sealed` is terminal.
+- `sealed -> awaiting_measurement` (only via seal revocation)
+- `sealed` is terminal for every other mutation.
+
+EvidenceSeal state:
+
+- `active -> revoked`
+- `revoked` is terminal; the seal remains as superseded history.
 
 Required invariants:
 
@@ -86,8 +108,12 @@ Required invariants:
 - A device has at most one unfinished verification case.
 - Measurements are accepted only while a case is awaiting measurement.
 - A tolerance must be positive.
-- A case can have at most one evidence seal.
-- A sealed case cannot accept measurements, reopen, or seal again.
+- A case can have at most one active evidence seal at any time.
+- A sealed case cannot accept measurements, reopen, or seal again; it can only
+  leave `sealed` through seal revocation.
+- A revocation preserves the original seal and records the reviewer, the
+  reason, and the time as an independent fact.
+- A seal created after a revocation must reference the seal it supersedes.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -112,6 +138,7 @@ Required invariants:
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/revoke-seal`
 - `GET /cases/{id}/events`
 
 ## Validation Plan
@@ -121,7 +148,9 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The revoke-seal check races two concurrent revocations and two
+concurrent re-seals to prove that exactly one revocation and exactly one
+successor seal survive, and that the case never holds two active seals.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green
